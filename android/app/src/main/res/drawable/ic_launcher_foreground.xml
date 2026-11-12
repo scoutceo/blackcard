@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 108dp adaptive canvas; safe zone is the centre 66dp. A card outline with a
+     contactless mark. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- card: 44 x 28, centred -->
+    <path android:strokeColor="#FFFFFFFF" android:strokeWidth="2.2"
+        android:fillColor="#00000000"
+        android:pathData="M36,40 h36 a4,4 0 0 1 4,4 v20 a4,4 0 0 1 -4,4 h-36 a4,4 0 0 1 -4,-4 v-20 a4,4 0 0 1 4,-4 z" />
+    <!-- contactless waves -->
+    <path android:strokeColor="#FF8E8E93" android:strokeWidth="2" android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M58,49.5 a6,6 0 0 1 0,9 M62,46.5 a10.5,10.5 0 0 1 0,15 M66,43.5 a15,15 0 0 1 0,21" />
+</vector>
