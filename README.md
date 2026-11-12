@@ -8,6 +8,10 @@ blackcard is **only a visual front end**. Google Wallet stays the default NFC
 payment app and answers the terminal in the background. blackcard never reads,
 stores, or transmits card data.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="blackcard on first launch: a black screen with an empty card outline reading &quot;Tap to choose a card image&quot; and a grey contactless icon above &quot;Hold Near Reader&quot;" width="300">
+</p>
+
 ## What it does
 
 - Pure `#000000` screen with no status bar, no white flash and no splash icon
