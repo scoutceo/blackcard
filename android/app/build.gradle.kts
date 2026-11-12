@@ -1,8 +1,19 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
+
+// Release signing key lives outside the repo (android/key.properties is
+// gitignored). Without it, builds fall back to the debug key so anyone can
+// still build from source.
+val keyProps = Properties().apply {
+    val f = rootProject.file("key.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val hasReleaseKey = keyProps.getProperty("storeFile") != null
 
 android {
     namespace = "app.blackcard"
@@ -28,12 +39,24 @@ android {
         versionName = flutter.versionName
     }
 
-    buildTypes {
-        release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = file(keyProps.getProperty("storeFile"))
+                storePassword = keyProps.getProperty("storePassword")
+                keyAlias = keyProps.getProperty("keyAlias")
+                keyPassword = keyProps.getProperty("keyPassword")
+            }
         }
+    }
+
+    buildTypes {
+        // Debug and release share one key, so switching between a hot-reload
+        // build and the daily build never forces an uninstall (which would
+        // wipe the saved card image).
+        val signing = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
+        debug { signingConfig = signing }
+        release { signingConfig = signing }
     }
 }
 

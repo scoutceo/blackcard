@@ -6,20 +6,13 @@ import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
-/// How long the screen stays up waiting for a reader before closing itself.
-const kTimeout = Duration(seconds: 60);
-
-const kBlack = Color(0xFF000000);
-const kGrey = Color(0xFF8E8E93);
-
-/// ISO/IEC 7810 ID-1 card proportions (85.60 × 53.98 mm).
-const kCardAspect = 85.60 / 53.98;
+import 'crop.dart';
+import 'settings.dart';
+import 'style.dart';
 
 /// Card flick: slightly under-damped (ζ ≈ 0.72) so it overshoots a touch and
 /// settles in roughly 600 ms.
 const _flickSpring = SpringDescription(mass: 1, stiffness: 140, damping: 17);
-
-const _native = MethodChannel('blackcard/native');
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,13 +23,15 @@ void main() {
 /// Hide the status and navigation bars: nothing on screen but the card.
 void _applySystemUi() {
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarColor: kBlack,
-    systemNavigationBarColor: kBlack,
-    systemNavigationBarDividerColor: kBlack,
-    statusBarIconBrightness: Brightness.light,
-    systemNavigationBarIconBrightness: Brightness.light,
-  ));
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUiOverlayStyle(
+      statusBarColor: kBlack,
+      systemNavigationBarColor: kBlack,
+      systemNavigationBarDividerColor: kBlack,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarIconBrightness: Brightness.light,
+    ),
+  );
 }
 
 class BlackcardApp extends StatelessWidget {
@@ -69,6 +64,7 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
   Uint8List? _card;
   bool _loaded = false;
   bool _nfcOn = true;
+  Settings _settings = Settings.defaults;
   Timer? _timeout;
 
   /// Bumped on every show/hide so stale async work and delays are ignored.
@@ -76,8 +72,9 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
   bool _landed = false;
 
   /// 0 = card below the screen, 1 = in place. Unbounded: the spring overshoots.
-  late final AnimationController _flick =
-      AnimationController.unbounded(vsync: this)..addListener(_onFlickTick);
+  late final AnimationController _flick = AnimationController.unbounded(
+    vsync: this,
+  )..addListener(_onFlickTick);
 
   late final AnimationController _readerIn = AnimationController(
     vsync: this,
@@ -95,7 +92,7 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
     super.initState();
     // The engine is pre-warmed at process start, before any screen exists, so
     // the session is driven purely by the Activity's shown/hidden events.
-    _native.setMethodCallHandler((call) async {
+    native.setMethodCallHandler((call) async {
       switch (call.method) {
         case 'shown':
           await _onShown();
@@ -104,6 +101,7 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
       }
     });
     _loadCard();
+    Settings.load().then((s) => _settings = s);
   }
 
   @override
@@ -144,6 +142,9 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
   void _onHidden() {
     _session++;
     _timeout?.cancel();
+    // The engine outlives the Activity: don't reopen into a half-finished
+    // crop or an open settings sheet.
+    if (mounted) Navigator.of(context).popUntil((r) => r.isFirst);
     _flick
       ..stop()
       ..value = 0;
@@ -161,14 +162,14 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
 
   void _restartTimeout() {
     _timeout?.cancel();
-    _timeout = Timer(kTimeout, () {
-      _native.invokeMethod('close').catchError((_) => null);
+    _timeout = Timer(Duration(seconds: _settings.timeoutSeconds), () {
+      native.invokeMethod('close').catchError((_) => null);
     });
   }
 
   Future<void> _refreshNfc() async {
     try {
-      final on = await _native.invokeMethod<bool>('nfcEnabled');
+      final on = await native.invokeMethod<bool>('nfcEnabled');
       if (mounted && on != null && on != _nfcOn) setState(() => _nfcOn = on);
     } on PlatformException catch (_) {
     } on MissingPluginException catch (_) {}
@@ -177,7 +178,7 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
   Future<void> _loadCard() async {
     Uint8List? bytes;
     try {
-      final path = await _native.invokeMethod<String>('cardPath');
+      final path = await native.invokeMethod<String>('cardPath');
       if (path != null) bytes = await File(path).readAsBytes();
     } on PlatformException catch (_) {
     } on MissingPluginException catch (_) {}
@@ -188,19 +189,82 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
     });
   }
 
-  Future<void> _pickCard() async {
+  /// Anything that changes the card or settings needs the phone unlocked,
+  /// since this screen can appear over the lock screen.
+  Future<bool> _ensureUnlocked() async {
+    try {
+      return await native.invokeMethod<bool>('unlock') ?? false;
+    } on MissingPluginException catch (_) {
+      return true;
+    }
+  }
+
+  /// Pauses the auto-close while [task] runs (picker, crop, settings).
+  Future<void> _paused(Future<void> Function() task) async {
     _timeout?.cancel();
     try {
-      final path = await _native.invokeMethod<String>('pickCard');
-      if (path != null) {
-        final bytes = await File(path).readAsBytes();
-        if (mounted) setState(() => _card = bytes);
-      }
-    } on PlatformException catch (_) {
-      // Picker cancelled or copy failed: keep the current card.
+      await task();
     } finally {
-      _restartTimeout();
+      if (mounted) _restartTimeout();
     }
+  }
+
+  Future<void> _openSettings() => _paused(() async {
+    if (!await _ensureUnlocked() || !mounted) return;
+    HapticFeedback.selectionClick();
+    final hasSource = await native.invokeMethod<String>('sourcePath') != null;
+    if (!mounted) return;
+    final action = await showSettingsSheet(
+      context,
+      settings: _settings,
+      canAdjust: hasSource,
+      onChanged: (s) {
+        if (s.timeoutSeconds != _settings.timeoutSeconds) {
+          native.invokeMethod('setTimeout', s.timeoutSeconds);
+        }
+        if (s.showOnLockScreen != _settings.showOnLockScreen) {
+          native.invokeMethod('setShowOnLockScreen', s.showOnLockScreen);
+        }
+        _settings = s;
+      },
+    );
+    switch (action) {
+      case SettingsAction.changeImage:
+        await _chooseImage();
+      case SettingsAction.adjustImage:
+        final source = await native.invokeMethod<String>('sourcePath');
+        if (source != null) await _crop(source);
+      case null:
+    }
+  });
+
+  Future<void> _chooseImage() => _paused(() async {
+    if (!await _ensureUnlocked()) return;
+    try {
+      final picked = await native.invokeMethod<String>('pickImage');
+      if (picked != null) await _crop(picked);
+    } on PlatformException catch (_) {
+      // Picker failed: keep the current card.
+    }
+  });
+
+  Future<void> _crop(String sourcePath) async {
+    if (!mounted) return;
+    final png = await Navigator.of(context).push<Uint8List>(
+      PageRouteBuilder(
+        opaque: true,
+        transitionDuration: const Duration(milliseconds: 220),
+        reverseTransitionDuration: const Duration(milliseconds: 180),
+        pageBuilder: (_, _, _) => CropScreen(sourcePath: sourcePath),
+        transitionsBuilder: (_, anim, _, child) =>
+            FadeTransition(opacity: anim, child: child),
+      ),
+    );
+    if (png == null) return;
+    try {
+      await native.invokeMethod<String>('saveCard', png);
+      if (mounted) setState(() => _card = png);
+    } on PlatformException catch (_) {}
   }
 
   @override
@@ -208,35 +272,38 @@ class _PayScreenState extends State<PayScreen> with TickerProviderStateMixin {
     return Scaffold(
       backgroundColor: kBlack,
       body: SafeArea(
-        child: LayoutBuilder(builder: (context, box) {
-          return Column(
-            children: [
-              SizedBox(height: box.maxHeight * 0.06),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: _Flick(
-                  animation: _flick,
-                  travel: MediaQuery.sizeOf(context).height,
-                  child: GestureDetector(
-                    // Long-press the card to change it; tap only when empty.
-                    onLongPress: _pickCard,
-                    onTap: _card == null && _loaded ? _pickCard : null,
-                    child: _CardFace(bytes: _card, loaded: _loaded),
+        child: LayoutBuilder(
+          builder: (context, box) {
+            return Column(
+              children: [
+                SizedBox(height: box.maxHeight * 0.06),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: _Flick(
+                    animation: _flick,
+                    travel: MediaQuery.sizeOf(context).height,
+                    child: GestureDetector(
+                      // Long-press for settings; tap only when there's no card yet.
+                      onLongPress: _openSettings,
+                      onTap: _card == null && _loaded ? _chooseImage : null,
+                      child: _CardFace(bytes: _card, loaded: _loaded),
+                    ),
                   ),
                 ),
-              ),
-              const Spacer(flex: 3),
-              _ReaderPrompt(
-                fadeIn: _readerIn,
-                breathe: _breathe,
-                nfcOn: _nfcOn,
-                onOpenNfcSettings: () =>
-                    _native.invokeMethod('openNfcSettings').catchError((_) => null),
-              ),
-              const Spacer(flex: 5),
-            ],
-          );
-        }),
+                const Spacer(flex: 3),
+                _ReaderPrompt(
+                  fadeIn: _readerIn,
+                  breathe: _breathe,
+                  nfcOn: _nfcOn,
+                  onOpenNfcSettings: () => native
+                      .invokeMethod('openNfcSettings')
+                      .catchError((_) => null),
+                ),
+                const Spacer(flex: 5),
+              ],
+            );
+          },
+        ),
       ),
     );
   }
@@ -286,42 +353,44 @@ class _CardFace extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(builder: (context, box) {
-      final radius = BorderRadius.circular(box.maxWidth * 0.045);
-      final dpr = MediaQuery.devicePixelRatioOf(context);
+    return LayoutBuilder(
+      builder: (context, box) {
+        final radius = BorderRadius.circular(box.maxWidth * kCardRadius);
+        final dpr = MediaQuery.devicePixelRatioOf(context);
 
-      final Widget face;
-      if (bytes != null) {
-        face = Image.memory(
-          bytes!,
-          fit: BoxFit.cover,
-          gaplessPlayback: true,
-          filterQuality: FilterQuality.medium,
-          // Decode at screen resolution, not the photo's full 12+ MP.
-          cacheWidth: (box.maxWidth * dpr).round(),
-        );
-      } else {
-        face = DecoratedBox(
-          decoration: BoxDecoration(
-            borderRadius: radius,
-            border: Border.all(color: const Color(0xFF2C2C2E), width: 1.5),
-          ),
-          child: Center(
-            child: loaded
-                ? const Text(
-                    'Tap to choose a card image',
-                    style: TextStyle(color: kGrey, fontSize: 15),
-                  )
-                : null,
-          ),
-        );
-      }
+        final Widget face;
+        if (bytes != null) {
+          face = Image.memory(
+            bytes!,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.medium,
+            // Decode at screen resolution, not the photo's full 12+ MP.
+            cacheWidth: (box.maxWidth * dpr).round(),
+          );
+        } else {
+          face = DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: radius,
+              border: Border.all(color: kHairline, width: 1.5),
+            ),
+            child: Center(
+              child: loaded
+                  ? const Text(
+                      'Tap to choose a card image',
+                      style: TextStyle(color: kGrey, fontSize: 15),
+                    )
+                  : null,
+            ),
+          );
+        }
 
-      return AspectRatio(
-        aspectRatio: kCardAspect,
-        child: ClipRRect(borderRadius: radius, child: face),
-      );
-    });
+        return AspectRatio(
+          aspectRatio: kCardAspect,
+          child: ClipRRect(borderRadius: radius, child: face),
+        );
+      },
+    );
   }
 }
 
@@ -343,7 +412,10 @@ class _ReaderPrompt extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final inCurve = CurvedAnimation(parent: fadeIn, curve: Curves.easeOut);
-    final breathCurve = CurvedAnimation(parent: breathe, curve: Curves.easeInOutSine);
+    final breathCurve = CurvedAnimation(
+      parent: breathe,
+      curve: Curves.easeInOutSine,
+    );
 
     final content = Column(
       mainAxisSize: MainAxisSize.min,
@@ -413,7 +485,11 @@ class _ContactlessMark extends CustomPainter {
       );
     }
     if (crossedOut) {
-      canvas.drawLine(Offset(s * 0.12, s * 0.1), Offset(s * 0.95, s * 0.9), paint);
+      canvas.drawLine(
+        Offset(s * 0.12, s * 0.1),
+        Offset(s * 0.95, s * 0.9),
+        paint,
+      );
     }
   }
 
