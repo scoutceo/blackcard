@@ -59,8 +59,9 @@ class _CropScreenState extends State<CropScreen> {
         buffer,
         getTargetSize: (w, h) {
           final longest = math.max(w, h);
-          if (longest <= _maxDecodeSide)
+          if (longest <= _maxDecodeSide) {
             return ui.TargetImageSize(width: w, height: h);
+          }
           final k = _maxDecodeSide / longest;
           return ui.TargetImageSize(
             width: (w * k).round(),
