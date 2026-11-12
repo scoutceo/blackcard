@@ -5,9 +5,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
+import android.nfc.NfcAdapter
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
+import android.provider.Settings
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -24,6 +26,7 @@ class MainActivity : FlutterActivity() {
     private var channel: MethodChannel? = null
     private var pendingPick: MethodChannel.Result? = null
     private var picking = false
+    private var awayInSettings = false
 
     private val screenOff = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) = close()
@@ -35,7 +38,19 @@ class MainActivity : FlutterActivity() {
         super.onCreate(savedInstanceState)
         // Stay lit while waiting for the reader; the Dart-side timeout bounds this.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        requestHighestRefreshRate()
         registerReceiver(screenOff, IntentFilter(Intent.ACTION_SCREEN_OFF))
+    }
+
+    /** Ask for the panel's fastest mode (120 Hz on the S26) so the card flick is smooth. */
+    private fun requestHighestRefreshRate() {
+        val display = (if (Build.VERSION.SDK_INT >= 30) display else null)
+            ?: @Suppress("DEPRECATION") windowManager.defaultDisplay
+        val current = display.mode
+        val best = display.supportedModes
+            .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+            .maxByOrNull { it.refreshRate } ?: return
+        window.attributes = window.attributes.also { it.preferredDisplayModeId = best.modeId }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -45,6 +60,12 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "cardPath" -> result.success(cardFile().takeIf { f -> f.exists() }?.absolutePath)
                     "pickCard" -> pickCard(result)
+                    "nfcEnabled" -> result.success(NfcAdapter.getDefaultAdapter(this)?.isEnabled == true)
+                    "openNfcSettings" -> {
+                        awayInSettings = true
+                        startActivity(Intent(Settings.ACTION_NFC_SETTINGS))
+                        result.success(null)
+                    }
                     "close" -> { result.success(null); close() }
                     else -> result.notImplemented()
                 }
@@ -60,16 +81,22 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        awayInSettings = false
         // The engine is cached across launches, so tell Dart a fresh "session"
-        // started: restart the timeout and reload the card.
+        // started: restart the timeout, recheck NFC and replay the card flick.
         if (!picking) channel?.invokeMethod("shown", null)
     }
 
     override fun onStop() {
         super.onStop()
+        if (picking || isChangingConfigurations) return
+        // Reset the Dart UI to its pre-animation state now, so the next launch
+        // never flashes the last frame before the flick starts.
+        channel?.invokeMethod("hidden", null)
         // Leaving the screen (home, app switch, Wallet's post-payment sheet)
-        // ends the session -- except while our own photo picker is on top.
-        if (!picking && !isChangingConfigurations) close()
+        // ends the session -- except while our own picker or the NFC settings
+        // page (opened from the "NFC is off" prompt) is on top.
+        if (!awayInSettings) close()
     }
 
     override fun onDestroy() {
